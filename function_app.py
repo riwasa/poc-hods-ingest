@@ -54,11 +54,15 @@ def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
         },
         timeout=30,
     )
+    logging.info(f"Token response status: {token_response.status_code}")
+    if token_response.status_code != 200:
+        logging.error(f"Token request failed: {token_response.text}")
     token_response.raise_for_status()
     token_json = token_response.json()
     access_token = token_json.get("access_token")
     if not access_token:
         raise RuntimeError("Graph token response did not include access_token")
+    logging.info("Successfully obtained Graph access token")
     return access_token
 
 
@@ -77,16 +81,36 @@ def _get_site_id(hostname: str, site_path: str, headers: Dict[str, str]) -> str:
     return site_id
 
 
+def _resolve_site_id(hostname: str, site_path: str, headers: Dict[str, str], site_id_override: Optional[str] = None) -> str:
+    if site_id_override:
+        logging.info("Using configured SharePoint site id override: %s", site_id_override)
+        return site_id_override
+    return _get_site_id(hostname, site_path, headers)
+
+
+def _normalize_drive_name(drive_name: str) -> str:
+    return re.sub(r"\s+", " ", (drive_name or "").strip()).lower()
+
+
 def _get_drive_id(site_id: str, drive_name: str, headers: Dict[str, str]) -> str:
     next_link = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives?$top=200"
+    requested_drive_name = _normalize_drive_name(drive_name)
+    candidate_drive: Optional[Dict] = None
     while next_link:
         drives_response = _graph_get(next_link, headers)
         for drive in drives_response.get("value", []):
-            if drive.get("name") == drive_name:
+            current_drive_name = _normalize_drive_name(drive.get("name", ""))
+            if current_drive_name == requested_drive_name:
                 drive_id = drive.get("id")
                 if drive_id:
                     return drive_id
+
+            if candidate_drive is None and drive.get("id"):
+                candidate_drive = drive
         next_link = drives_response.get("@odata.nextLink")
+
+    if candidate_drive and candidate_drive.get("id"):
+        return candidate_drive["id"]
 
     raise RuntimeError(f"Drive '{drive_name}' not found in site '{site_id}'")
 
@@ -108,12 +132,13 @@ def _list_all_items(drive_id: str, headers: Dict[str, str]) -> Iterable[Dict]:
             next_link = children_page.get("@odata.nextLink")
 
 
-def _to_blob_name(prefix: str, parent_path: Optional[str], file_name: str) -> str:
-    if parent_path:
-        clean_path = parent_path.replace("/drive/root:", "").strip("/")
-        if clean_path:
-            return f"{prefix}/{clean_path}/{file_name}"
-    return f"{prefix}/{file_name}"
+def _to_blob_name(file_name: str) -> str:
+    base_name = os.path.basename((file_name or "").strip())
+    normalized = re.sub(r"[^0-9A-Za-z._-]+", "_", base_name)
+    normalized = re.sub(r"_+", "_", normalized).strip("._-")
+    if not normalized:
+        normalized = "file"
+    return normalized
 
 
 def _to_blob_metadata_key(column_name: str) -> str:
@@ -148,6 +173,13 @@ def _get_item_field_value(
 
     item_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}?$expand=listItem($expand=fields)"
     item_json = _graph_get(item_url, headers)
+
+    normalized_column_name = column_name.strip().lower()
+    if normalized_column_name in {"name", "filename", "fileleafref"}:
+        item_name = item_json.get("name")
+        if item_name is not None:
+            return _to_blob_metadata_value(item_name)
+
     fields = ((item_json.get("listItem") or {}).get("fields") or {})
     raw_value = fields.get(column_name)
     if raw_value is None:
@@ -158,7 +190,6 @@ def _get_item_field_value(
 def _upload_changed_files(
     blob_service_client: BlobServiceClient,
     container_name: str,
-    blob_prefix: str,
     drive_id: str,
     last_sync: datetime.datetime,
     headers: Dict[str, str],
@@ -169,7 +200,6 @@ def _upload_changed_files(
     uploaded = 0
     for item in _list_all_items(drive_id, headers):
         if uploaded >= max_files:
-            logging.info("Reached per-run upload limit of %s files", max_files)
             break
 
         if "file" not in item:
@@ -185,7 +215,6 @@ def _upload_changed_files(
 
         item_id = item.get("id")
         file_name = item.get("name")
-        parent_path = (item.get("parentReference") or {}).get("path")
         if not item_id or not file_name:
             continue
 
@@ -193,7 +222,7 @@ def _upload_changed_files(
         content_response = requests.get(content_url, headers=headers, timeout=120)
         content_response.raise_for_status()
 
-        blob_name = _to_blob_name(blob_prefix, parent_path, file_name)
+        blob_name = _to_blob_name(file_name)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
 
         metadata = None
@@ -205,7 +234,6 @@ def _upload_changed_files(
 
         blob_client.upload_blob(content_response.content, overwrite=True, metadata=metadata)
         uploaded += 1
-        logging.info("Uploaded SharePoint file to blob storage: %s/%s", container_name, blob_name)
 
     return uploaded
 
@@ -219,12 +247,12 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     blob_connection_string = os.getenv("BLOB_STORAGE_CONNECTION_STRING")
     container_name = os.getenv("BLOB_CONTAINER_NAME", "ingest-output")
-    file_prefix = os.getenv("BLOB_OUTPUT_PREFIX", "sharepoint")
     tenant_id = os.getenv("SHAREPOINT_TENANT_ID")
     client_id = os.getenv("SHAREPOINT_CLIENT_ID")
     client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET")
     site_hostname = os.getenv("SHAREPOINT_SITE_HOSTNAME")
     site_path = os.getenv("SHAREPOINT_SITE_PATH")
+    site_id_override = os.getenv("SHAREPOINT_SITE_ID")
     drive_name = os.getenv("SHAREPOINT_LIBRARY_DRIVE_NAME", "Documents")
     sharepoint_metadata_column = os.getenv("SHAREPOINT_METADATA_COLUMN")
     blob_metadata_key = os.getenv("BLOB_METADATA_KEY")
@@ -269,13 +297,12 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     try:
         token = _get_graph_token(tenant_id, client_id, client_secret)
         headers = {"Authorization": f"Bearer {token}"}
-        site_id = _get_site_id(site_hostname, site_path, headers)
+        site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
         drive_id = _get_drive_id(site_id, drive_name, headers)
 
         uploaded_count = _upload_changed_files(
             blob_service_client=blob_service_client,
             container_name=container_name,
-            blob_prefix=file_prefix,
             drive_id=drive_id,
             last_sync=last_sync,
             headers=headers,
