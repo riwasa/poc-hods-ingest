@@ -1,5 +1,6 @@
 import azure.functions as func
 import datetime
+import json
 import logging
 import os
 import re
@@ -141,62 +142,152 @@ def _to_blob_name(file_name: str) -> str:
     return normalized
 
 
-def _to_blob_metadata_key(column_name: str) -> str:
-    # Blob metadata keys are restricted to a subset of ASCII characters.
-    normalized = re.sub(r"[^0-9A-Za-z_]", "_", (column_name or "").strip())
-    if not normalized:
-        return "sharepoint_column"
-    if not re.match(r"^[A-Za-z_]", normalized):
-        normalized = f"m_{normalized}"
-    return normalized.lower()
-
-
 def _to_blob_metadata_value(raw_value: object) -> str:
     if raw_value is None:
         return ""
-    if isinstance(raw_value, (dict, list)):
-        text = str(raw_value)
+    if isinstance(raw_value, list):
+        # Multi-value lookup columns are returned as a list of
+        # {"LookupId": ..., "LookupValue": ...} objects.  Extract just
+        # the display values and serialise as a JSON array.
+        values: List[str] = []
+        for item in raw_value:
+            if isinstance(item, dict):
+                lookup_value = item.get("LookupValue") or item.get("lookupValue")
+                values.append(str(lookup_value) if lookup_value is not None else str(item))
+            else:
+                values.append(str(item))
+        text = json.dumps(values, ensure_ascii=True)
+    elif isinstance(raw_value, dict):
+        # Single-value lookup columns are returned as {"LookupId": ..., "LookupValue": ...}.
+        lookup_value = raw_value.get("LookupValue") or raw_value.get("lookupValue")
+        text = str(lookup_value) if lookup_value is not None else str(raw_value)
     else:
         text = str(raw_value)
     # Azure Blob metadata values are ASCII-only; drop unsupported chars.
     return text.encode("ascii", errors="ignore").decode("ascii")
 
 
-def _get_item_field_value(
-    drive_id: str,
-    item_id: str,
-    column_name: str,
+def _get_drive_list_id(drive_id: str, headers: Dict[str, str]) -> str:
+    """Return the SharePoint list GUID for the document library behind a drive."""
+    drive_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}?$select=id,sharePointIds"
+    drive_json = _graph_get(drive_url, headers)
+    list_id = ((drive_json.get("sharePointIds") or {}).get("listId"))
+    if not list_id:
+        raise RuntimeError(f"Could not resolve SharePoint list ID for drive '{drive_id}'")
+    return list_id
+
+
+def _get_lookup_column_info(site_id: str, list_id: str, column_name: str, headers: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Return lookup metadata (target list + target column) for a list column."""
+    columns_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns?$select=name,displayName,lookup"
+    columns_json = _graph_get(columns_url, headers)
+    target = (column_name or "").strip().lower()
+
+    for column in columns_json.get("value", []):
+        name = (column.get("name") or "").strip().lower()
+        display_name = (column.get("displayName") or "").strip().lower()
+        if target not in {name, display_name}:
+            continue
+
+        lookup = column.get("lookup") or {}
+        lookup_list_id = lookup.get("listId")
+        if not lookup_list_id:
+            return None
+
+        # The lookup source column is often "Title" when the list displays Name.
+        # Keep a robust fallback chain when reading the lookup item fields.
+        lookup_column = lookup.get("columnName") or "Title"
+        return {
+            "lookup_list_id": str(lookup_list_id),
+            "lookup_column": str(lookup_column),
+        }
+
+    return None
+
+
+def _get_lookup_item_display_value(
+    site_id: str,
+    lookup_list_id: str,
+    lookup_item_id: object,
+    lookup_column: str,
     headers: Dict[str, str],
 ) -> Optional[str]:
-    if not column_name:
+    """Resolve a lookup item ID to human-readable text from the lookup list."""
+    if lookup_item_id is None:
         return None
 
-    item_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}?$expand=listItem($expand=fields)"
-    item_json = _graph_get(item_url, headers)
-
-    normalized_column_name = column_name.strip().lower()
-    if normalized_column_name in {"name", "filename", "fileleafref"}:
-        item_name = item_json.get("name")
-        if item_name is not None:
-            return _to_blob_metadata_value(item_name)
-
-    fields = ((item_json.get("listItem") or {}).get("fields") or {})
-    raw_value = fields.get(column_name)
-    if raw_value is None:
+    lookup_item_id_text = str(lookup_item_id).strip()
+    if not lookup_item_id_text:
         return None
-    return _to_blob_metadata_value(raw_value)
+
+    select = f"{lookup_column},Title,Name"
+    lookup_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{lookup_list_id}"
+        f"/items/{lookup_item_id_text}?$expand=fields($select={select})"
+    )
+
+    try:
+        lookup_json = _graph_get(lookup_url, headers)
+    except Exception as exc:
+        logging.warning("Failed to resolve lookup item %s from list %s: %s", lookup_item_id_text, lookup_list_id, exc)
+        return None
+
+    fields = (lookup_json.get("fields") or {})
+    for candidate in [lookup_column, "Title", "Name"]:
+        value = fields.get(candidate)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _fetch_item_fields(
+    drive_id: str,
+    item_id: str,
+    site_id: str,
+    list_id: str,
+    headers: Dict[str, str],
+) -> Dict:
+    """Return the SharePoint list-item fields dict for a drive item.
+
+    Uses the sites/lists endpoint which reliably returns lookup display values
+    (LookupValue) that the drive-based endpoint sometimes omits.
+    """
+    # Step 1: resolve the SharePoint list item integer ID from the drive item.
+    sp_id_url = (
+        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}"
+        f"?$expand=listItem($select=id)"
+    )
+    sp_id_json = _graph_get(sp_id_url, headers)
+    sp_item_id = ((sp_id_json.get("listItem") or {}).get("id"))
+    if not sp_item_id:
+        logging.warning("Could not resolve SharePoint item ID for drive item %s", item_id)
+        return {}
+
+    # Step 2: fetch fields via the sites/lists endpoint.  This path is more
+    # feature-complete and returns LookupValue for lookup columns.
+    select = "PrefixLookupId,PrefixLookupValue,HODSContentType"
+    fields_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}"
+        f"/items/{sp_item_id}?$expand=fields($select={select})"
+    )
+    fields_json = _graph_get(fields_url, headers)
+    fields = (fields_json.get("fields") or {})
+    logging.info("Item %s available field keys: %s", item_id, sorted(fields.keys()))
+    return fields
 
 
 def _upload_changed_files(
     blob_service_client: BlobServiceClient,
     container_name: str,
     drive_id: str,
+    site_id: str,
     last_sync: datetime.datetime,
     headers: Dict[str, str],
-    sharepoint_metadata_column: Optional[str] = None,
-    blob_metadata_key: Optional[str] = None,
     max_files: int = 5,
 ) -> int:
+    # Resolve the SharePoint list ID once for the whole run.
+    list_id = _get_drive_list_id(drive_id, headers)
+    prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
     uploaded = 0
     for item in _list_all_items(drive_id, headers):
         if uploaded >= max_files:
@@ -225,14 +316,46 @@ def _upload_changed_files(
         blob_name = _to_blob_name(file_name)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
 
-        metadata = None
-        if sharepoint_metadata_column:
-            field_value = _get_item_field_value(drive_id, item_id, sharepoint_metadata_column, headers)
-            if field_value is not None:
-                metadata_name = blob_metadata_key or _to_blob_metadata_key(sharepoint_metadata_column)
-                metadata = {metadata_name: field_value}
+        # Fetch SharePoint list-item fields once for all metadata columns.
+        fields = _fetch_item_fields(drive_id, item_id, site_id, list_id, headers)
 
-        blob_client.upload_blob(content_response.content, overwrite=True, metadata=metadata)
+        metadata: Dict[str, str] = {}
+
+        # Always capture the last-modified timestamp.
+        metadata["Modified"] = _to_blob_metadata_value(modified_raw)
+
+        # Always capture the single-value "Prefix" lookup column as text.
+        prefix_raw = fields.get("PrefixLookupValue")
+        if prefix_raw is None:
+            prefix_lookup_id = fields.get("PrefixLookupId")
+            if prefix_lookup_id is not None and prefix_lookup_info:
+                prefix_raw = _get_lookup_item_display_value(
+                    site_id=site_id,
+                    lookup_list_id=prefix_lookup_info["lookup_list_id"],
+                    lookup_item_id=prefix_lookup_id,
+                    lookup_column=prefix_lookup_info["lookup_column"],
+                    headers=headers,
+                )
+
+        if prefix_raw is not None:
+            metadata["Prefix"] = _to_blob_metadata_value(prefix_raw)
+        else:
+            logging.warning(
+                "Could not resolve Prefix display value for item %s. Available field keys: %s",
+                item_id, sorted(fields.keys()),
+            )
+
+        # Always capture the multi-value "HODS Content Type" lookup column.
+        hods_content_type_raw = fields.get("HODSContentType")
+        if hods_content_type_raw is not None:
+            metadata["ContentType"] = _to_blob_metadata_value(hods_content_type_raw)
+        else:
+            logging.warning(
+                "'HODSContentType' field not found for item %s. Available field keys: %s",
+                item_id, sorted(fields.keys()),
+            )
+
+        blob_client.upload_blob(content_response.content, overwrite=True, metadata=metadata or None)
         uploaded += 1
 
     return uploaded
@@ -254,8 +377,6 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     site_path = os.getenv("SHAREPOINT_SITE_PATH")
     site_id_override = os.getenv("SHAREPOINT_SITE_ID")
     drive_name = os.getenv("SHAREPOINT_LIBRARY_DRIVE_NAME", "Documents")
-    sharepoint_metadata_column = os.getenv("SHAREPOINT_METADATA_COLUMN")
-    blob_metadata_key = os.getenv("BLOB_METADATA_KEY")
 
     if not blob_connection_string:
         logging.error("Missing app setting: BLOB_STORAGE_CONNECTION_STRING")
@@ -304,10 +425,9 @@ def Ingest(myTimer: func.TimerRequest) -> None:
             blob_service_client=blob_service_client,
             container_name=container_name,
             drive_id=drive_id,
+            site_id=site_id,
             last_sync=last_sync,
             headers=headers,
-            sharepoint_metadata_column=sharepoint_metadata_column,
-            blob_metadata_key=blob_metadata_key,
             max_files=5,
         )
         logging.info("Completed SharePoint sync. Files uploaded: %s", uploaded_count)
