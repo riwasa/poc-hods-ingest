@@ -5,7 +5,6 @@
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "BLOB_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=<account-name>;AccountKey=<account-key>;EndpointSuffix=core.windows.net",
     "BLOB_CONTAINER_NAME": "ingest-output",
-    "BLOB_OUTPUT_PREFIX": "sharepoint",
     "SHAREPOINT_TENANT_ID": "",
     "SHAREPOINT_CLIENT_ID": "",
     "SHAREPOINT_CLIENT_SECRET": "",
